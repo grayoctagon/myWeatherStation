@@ -19,10 +19,13 @@ static const char INDEX_HTML[] PROGMEM = R"HTML_INDEX(
     .grid{ display:grid; grid-template-columns:1fr; gap:12px; }
     .card{ background:var(--card); border:1px solid var(--border); border-radius:14px; padding:12px; backdrop-filter:blur(6px); }
     .stats{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:10px; }
-    .stat{ background:#fff; border:1px solid var(--border); border-radius:12px; padding:10px; }
+    .stat{ background:#fff; border:1px solid var(--border); border-radius:12px; padding:10px; box-sizing:border-box; cursor:pointer; user-select:none; }
+    .stat.active{ border:2px solid #1e90ff; }
     .stat .k{ font-size:12px; opacity:0.8; }
     .stat .v{ font-size:22px; font-weight:650; margin-top:2px; }
     .sub{ margin-top:6px; font-size:12px; opacity:0.85; display:flex; gap:10px; flex-wrap:wrap; }
+    .dlbtn{ padding:6px 10px; border-radius:10px; border:1px solid var(--border); background:#fff; cursor:pointer; }
+    .dlbtn[disabled]{ opacity:0.6; cursor:not-allowed; }
     canvas{ width:100% !important; height:54vh !important; }
     @media (min-width:900px){ .grid{ grid-template-columns:2fr 1fr; } canvas{ height:62vh !important; } }
   </style>
@@ -38,14 +41,19 @@ static const char INDEX_HTML[] PROGMEM = R"HTML_INDEX(
       <div class="card">
         <div style="font-weight:650;margin-bottom:8px;">Aktuell</div>
         <div class="stats">
-          <div class="stat"><div class="k">Temp</div><div class="v" id="t">-</div></div>
-          <div class="stat"><div class="k">Hum</div><div class="v" id="h">-</div></div>
-          <div class="stat"><div class="k">Pres</div><div class="v" id="p">-</div></div>
+          <div class="stat" data-screen="0"><div class="k">Temp</div><div class="v" id="t">-</div></div>
+          <div class="stat" data-screen="1"><div class="k">Hum</div><div class="v" id="h">-</div></div>
+          <div class="stat" data-screen="2"><div class="k">Pres</div><div class="v" id="p">-</div></div>
         </div>
         <div class="sub">
           <div id="time">Zeit: -</div>
           <div id="wifi">WiFi: -</div>
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
           <div id="ip">IP: -</div>
+            <button id="dlBtn" class="dlbtn" onclick="downloadCsv()">download csv (-)</button>
+            <button id="clearBtn" class="dlbtn" onclick="clearLog()">clear</button>
+            <div id="dlStatus"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -56,6 +64,74 @@ static const char INDEX_HTML[] PROGMEM = R"HTML_INDEX(
     let chart;
     function fmt(v,d=2){ if(v===null||v===undefined||Number.isNaN(v)) return "-"; return Number(v).toFixed(d); }
     async function getJSON(url){ const r=await fetch(url,{cache:"no-store"}); if(!r.ok) throw new Error(await r.text()); return await r.json(); }
+
+    
+    const nfInt = new Intl.NumberFormat("de-DE");
+    function fmtInt(n){ return nfInt.format(Number(n||0)); }
+    function approxKB(bytes){ return Math.max(0, Math.round(Number(bytes||0) / 1024)); }
+
+    function updateStatHighlight(st){
+      document.querySelectorAll(".stat").forEach(el=>el.classList.remove("active"));
+      if(st.autoswitchScreens) return; // wenn autoswitch aktiv ist: nichts highlighten
+      const el=document.querySelector(`.stat[data-screen="${st.screenIdx}"]`);
+      if(el) el.classList.add("active");
+    }
+
+    function updateDownloadLabel(st){
+      const btn=document.getElementById("dlBtn");
+      const clearBtn=document.getElementById("clearBtn");
+      const status=document.getElementById("dlStatus");
+
+      if(!st || !st.log_exists){
+        btn.disabled=true;
+        if (clearBtn) clearBtn.disabled=true;
+        btn.dataset.base="download csv (0 lines ~0KB)";
+        if(!btn.dataset.downloading) btn.textContent=btn.dataset.base;
+        status.textContent="";
+        return;
+      }
+
+      const linesTotal = Number(st.log_lines||0);
+      const linesData = Math.max(0, linesTotal - 1); // minus header
+      const kb = approxKB(st.log_bytes||0);
+
+      btn.disabled=false;
+      if (clearBtn) clearBtn.disabled=false;
+      btn.dataset.base = `download csv (${fmtInt(linesData)} lines ~${kb}KB)`;
+      if(!btn.dataset.downloading) btn.textContent = btn.dataset.base;
+    }
+    
+    async function clearLog(){
+      const clearBtn=document.getElementById("clearBtn");
+      if (clearBtn && clearBtn.disabled) return;
+      if (!confirm("Log wirklich löschen?")) return;
+      try{
+        clearBtn.disabled = true;
+        await fetch("/api/log/clear", { method:"POST" });
+      }catch(e){}
+      try{
+        await refreshState();
+      }catch(e){}
+      if (clearBtn) clearBtn.disabled = false;
+    }
+
+    async function setOledScreen(idx){
+      try{
+        await fetch(`/api/screen?idx=${idx}`, { method:"POST" });
+      }catch(e){}
+      try{
+        await refreshState();
+      }catch(e){}
+    }
+
+    function wireStatClicks(){
+      document.querySelectorAll(".stat").forEach(el=>{
+        el.addEventListener("click", ()=>{
+          const idx = Number(el.dataset.screen);
+          if(Number.isFinite(idx)) setOledScreen(idx);
+        });
+      });
+    }
 
     function buildChart(labels,temp,hum,pres){
       const ctx=document.getElementById("chart");
@@ -101,6 +177,71 @@ static const char INDEX_HTML[] PROGMEM = R"HTML_INDEX(
       document.getElementById("time").textContent="Zeit: "+(st.time_str||"-");
       document.getElementById("wifi").textContent="WiFi: "+(st.ssid||"-");
       document.getElementById("ip").textContent="IP: "+(st.ip||"-");
+      updateStatHighlight(st);
+      updateDownloadLabel(st);
+    }
+    
+    function downloadCsv(){
+      const btn=document.getElementById("dlBtn");
+      const status=document.getElementById("dlStatus");
+      const base = btn.dataset.base || btn.textContent || "download csv";
+      if(btn.disabled) return;
+
+      btn.dataset.downloading="1";
+      btn.disabled=true;
+      status.textContent="0%";
+      btn.textContent = base + " (0%)";
+
+      const xhr=new XMLHttpRequest();
+      xhr.open("GET","/download",true);
+      xhr.responseType="blob";
+
+      xhr.onprogress=(e)=>{
+        if(e.lengthComputable){
+          const pct=Math.max(0, Math.min(100, Math.round((e.loaded / e.total) * 100)));
+          status.textContent = pct + "%";
+          btn.textContent = base + " (" + pct + "%)";
+        }else{
+          status.textContent = Math.round(e.loaded/1024) + "KB";
+        }
+      };
+
+      xhr.onload=()=>{
+        btn.disabled=false;
+        delete btn.dataset.downloading;
+        status.textContent="";
+        btn.textContent = base;
+
+        if(xhr.status !== 200){
+          alert("Download fehlgeschlagen: " + xhr.status);
+          return;
+        }
+
+        let filename="log.csv";
+        const cd = xhr.getResponseHeader("Content-Disposition") || "";
+        const m = /filename="([^"]+)"/.exec(cd);
+        if(m && m[1]) filename = m[1];
+
+        const blob=xhr.response;
+        const url=URL.createObjectURL(blob);
+        const a=document.createElement("a");
+        a.href=url;
+        a.download=filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(()=>URL.revokeObjectURL(url), 1500);
+      };
+
+      xhr.onerror=()=>{
+        btn.disabled=false;
+        delete btn.dataset.downloading;
+        status.textContent="";
+        btn.textContent = base;
+        alert("Download fehlgeschlagen (Netzwerk).");
+      };
+
+      xhr.send();
     }
 
     async function loop(){
@@ -108,6 +249,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML_INDEX(
       try{ await refreshHistory(); }catch(e){}
       setTimeout(loop,2500);
     }
+    wireStatClicks();
     loop();
   </script>
 </body>

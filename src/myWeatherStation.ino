@@ -148,6 +148,59 @@ const char* CONFIG_PATH  = "/config.json";
 const char* LOG_PATH     = "/log.csv";
 const char* LOG_TMP_PATH = "/log.tmp";
 
+
+// ---------------- Log info (for UI) ----------------
+static uint32_t logInfoLines = 0;
+static uint32_t logInfoBytes = 0;
+static uint32_t logInfoAtMs  = 0;
+
+static void refreshLogInfo(bool force = false) {
+  uint32_t now = millis();
+  if (!force && (uint32_t)(now - logInfoAtMs) < 15000UL) return; // max. alle 15s scannen
+  logInfoAtMs = now;
+
+  logInfoLines = 0;
+  logInfoBytes = 0;
+
+  if (!SPIFFS.exists(LOG_PATH)) return;
+  File f = SPIFFS.open(LOG_PATH, FILE_READ);
+  if (!f) return;
+
+  logInfoBytes = f.size();
+
+  const size_t BUFSZ = 512;
+  uint8_t buf[BUFSZ];
+  int lastChar = -1;
+
+  while (f.available()) {
+    size_t n = f.read(buf, BUFSZ);
+    if (n == 0) break;
+    lastChar = buf[n - 1];
+    for (size_t i = 0; i < n; i++) {
+      if (buf[i] == '\n') logInfoLines++;
+    }
+  }
+  f.close();
+
+  // falls die letzte Zeile nicht mit \n endet
+  if (logInfoBytes > 0 && lastChar != '\n') logInfoLines++;
+}
+
+static String makeDownloadFilename() {
+  if (timeSynced) {
+    time_t tt = (time_t)nowEpochOrUptime();
+    struct tm tmv;
+    localtime_r(&tt, &tmv);
+    char buf[40];
+    strftime(buf, sizeof(buf), "temp%Y-%m-%d_%H-%M-%S.log", &tmv);
+    return String(buf);
+  }
+
+  char buf[40];
+  snprintf(buf, sizeof(buf), "temp_uptime%lus.log", (unsigned long)(millis() / 1000UL));
+  return String(buf);
+}
+
 // ---------------- Helpers ----------------
 static void safeStrCopy(char* dst, size_t dstLen, const String& src) {
   if (dstLen == 0) return;
@@ -948,10 +1001,18 @@ static void handleRoot() { server.send_P(200, "text/html", INDEX_HTML); }
 static void handleSettings() { server.send_P(200, "text/html", SETTINGS_HTML); }
 
 static void handleApiState() {
-  StaticJsonDocument<384> doc;
+  StaticJsonDocument<768> doc;
   doc["temp"] = curTemp;
   doc["hum"]  = curHum;
   doc["pres"] = curPres;
+
+  doc["screenIdx"] = screenIdx;
+  doc["autoswitchScreens"] = autoswitchScreens;
+
+  refreshLogInfo(false);
+  doc["log_exists"] = SPIFFS.exists(LOG_PATH);
+  doc["log_bytes"] = logInfoBytes;
+  doc["log_lines"] = logInfoLines;
 
   doc["time_synced"] = timeSynced;
   doc["time"] = nowEpochOrUptime();
@@ -971,6 +1032,63 @@ static void handleApiState() {
 
   String out;
   serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+static void handleDownloadLog() {
+  if (!SPIFFS.exists(LOG_PATH)) {
+    server.send(404, "text/plain", "log.csv not found");
+    return;
+  }
+
+  File f = SPIFFS.open(LOG_PATH, FILE_READ);
+  if (!f) {
+    server.send(500, "text/plain", "open failed");
+    return;
+  }
+
+  size_t len = f.size();
+  String fname = makeDownloadFilename();
+
+  // wichtig fuer Download + Fortschritt (Content-Length)
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + fname + "\"");
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Content-Length", String(len));
+
+  server.streamFile(f, "text/csv");
+  f.close();
+}
+
+static void handleApiScreenSet() {
+  int idx = -1;
+
+  if (server.hasArg("idx")) {
+    idx = server.arg("idx").toInt();
+  } else if (server.hasArg("plain")) {
+    StaticJsonDocument<128> doc;
+    DeserializationError err = deserializeJson(doc, server.arg("plain"));
+    if (!err) {
+      idx = doc["screenIdx"] | doc["idx"] | -1;
+    }
+  }
+
+  if (idx < 0 || idx > 2) {
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad idx\"}");
+    return;
+  }
+
+  screenIdx = (uint8_t)idx;     // sofort auf OLED anzeigen
+  cfg.screenIdx = (uint8_t)idx; // nur RAM (kein Flash write)
+  lastScreenMs = millis();      // Timer neu starten
+  redrawScreen();
+
+  StaticJsonDocument<192> outDoc;
+  outDoc["ok"] = true;
+  outDoc["screenIdx"] = screenIdx;
+  outDoc["autoswitchScreens"] = autoswitchScreens;
+
+  String out;
+  serializeJson(outDoc, out);
   server.send(200, "application/json", out);
 }
 
@@ -1133,9 +1251,39 @@ static void setupWeb() {
   server.on("/api/config", HTTP_GET, handleApiConfigGet);
   server.on("/api/config", HTTP_POST, handleApiConfigPost);
   server.on("/api/wifi/reconnect", HTTP_POST, handleWifiReconnect);
+  server.on("/api/screen", HTTP_POST, handleApiScreenSet);
+  server.on("/download", HTTP_GET, handleDownloadLog);
+  server.on("/api/log/clear", HTTP_POST, handleApiLogClear);
   server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
   server.begin();
   Serial.println("Web server started.");
+}
+
+static void handleApiLogClear() {
+  bool existed = SPIFFS.exists(LOG_PATH);
+  if (existed) {
+    SPIFFS.remove(LOG_PATH);
+  }
+
+  // optional: Datei sofort wieder anlegen (damit spätere Append-Logik sicher ist)
+  // und Header schreiben (bitte Header an deinen bestehenden CSV-Header anpassen)
+  File f = SPIFFS.open(LOG_PATH, FILE_WRITE);
+  if (f) {
+    f.println("epoch,ts,temp_min,temp_max,temp_avg,hum_min,hum_max,hum_avg,pres_min,pres_max,pres_avg");  // (hier ggf. deinen echten Header einsetzen)
+    f.close();
+  }
+
+  refreshLogInfo(true);
+
+  StaticJsonDocument<192> doc;
+  doc["ok"] = true;
+  doc["cleared"] = existed;
+  doc["log_exists"] = SPIFFS.exists(LOG_PATH);
+  doc["log_bytes"] = logInfoBytes;
+  doc["log_lines"] = logInfoLines;
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
 }
 
 // ---------------- Button handling ----------------
