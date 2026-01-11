@@ -130,7 +130,7 @@ uint32_t lastLogFlushMs  = 0;
 // ---------------- Time keeping ----------------
 bool timeSynced = false;
 uint32_t lastSyncMillis = 0;
-uint32_t lastNtpSyncMs = 0;
+uint32_t lastNtpSyncTry = 0;
 time_t lastSyncEpoch = 0;
 
 // ---------------- Logging aggregate ----------------
@@ -192,6 +192,21 @@ static String formatTimeLabel(uint32_t epochOrUptime) {
   localtime_r(&tt, &tmv);
   char buf[16];
   strftime(buf, sizeof(buf), "%H:%M:%S", &tmv);
+  return String(buf);
+}
+
+static String formatDateLabel(uint32_t epochOrUptime) {
+  if (!timeSynced) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "+%lus", (unsigned long)epochOrUptime);
+    return String(buf);
+  }
+
+  time_t tt = (time_t)epochOrUptime;
+  struct tm tmv;
+  localtime_r(&tt, &tmv);
+  char buf[16];
+  strftime(buf, sizeof(buf), "%Y-%m-%d", &tmv);
   return String(buf);
 }
 
@@ -279,42 +294,160 @@ static void drawGraph(uint8_t var) {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   char buf[16];
-
+  display.setTextWrap(false);
   fmtFloat(buf, sizeof(buf), mx, (var == VAR_PRES) ? 0 : 1);
-  display.setCursor(GRAPH_W + 2, GRAPH_Y);
+  display.setCursor(GRAPH_W + 1, GRAPH_Y);
   display.print(buf);
 
   fmtFloat(buf, sizeof(buf), mn, (var == VAR_PRES) ? 0 : 1);
-  display.setCursor(GRAPH_W + 2, GRAPH_Y + GRAPH_H - 10);
+  display.setCursor(GRAPH_W + 1, GRAPH_Y + GRAPH_H - 10);
   display.print(buf);
 }
 
 static void drawHeader(uint8_t var) {
   display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(2);
+  display.setTextSize(1);
   display.setCursor(0, 0);
 
   char buf[16];
 
   if (var == VAR_TEMP) {
-    fmtFloat(buf, sizeof(buf), curTemp, 1);
-    display.print(buf);
-    display.setTextSize(1);
-    display.setCursor(0, 20);
     display.print("Temp (C)");
+    display.setTextSize(2);
+    display.setCursor(0, 11);
+    fmtFloat(buf, sizeof(buf), curTemp, 2);
+    display.print(buf);
   } else if (var == VAR_HUM) {
+    display.print("Hum (%)");
+    display.setTextSize(2);
+    display.setCursor(0, 11);
     fmtFloat(buf, sizeof(buf), curHum, 1);
     display.print(buf);
-    display.setTextSize(1);
-    display.setCursor(0, 20);
-    display.print("Hum (%)");
   } else {
-    fmtFloat(buf, sizeof(buf), curPres, 0);
-    display.print(buf);
-    display.setTextSize(1);
-    display.setCursor(0, 20);
     display.print("Pres (hPa)");
+    display.setTextSize(2);
+    display.setCursor(0, 11);
+    fmtFloat(buf, sizeof(buf), curPres, 1);
+    display.print(buf);
   }
+  display.setTextSize(1);
+  String date=formatDateLabel(nowEpochOrUptime());
+  String time=formatTimeLabel(nowEpochOrUptime());
+  display.setCursor(128-6*date.length(), 0);
+  display.print(date);
+  display.setCursor(128-6*time.length(), 11);
+  display.print(time);
+}
+
+static String ellipsize(const String &s, uint8_t maxChars) {
+  if (maxChars < 4) return s.substring(0, maxChars);
+  if (s.length() <= maxChars) return s;
+  return s.substring(0, maxChars - 3) + "...";
+}
+
+void drawWifiStatus() {
+  const bool staConnected = ((WiFi.getMode() & WIFI_MODE_STA) && (WiFi.status() == WL_CONNECTED));
+  const bool apRunning    = (WiFi.getMode() & WIFI_MODE_AP);
+
+  const uint32_t durationMs = staConnected ? 5000UL : 15000UL;
+  const uint32_t startMs = millis();
+
+  // Layout
+  const int lineH = 8;                    // Textsize(1) Zeilenhöhe
+  const int bodyY = 18;                   // unter Datum/Uhrzeit
+  const int barH  = 6;
+  const int barY  = SCREEN_HEIGHT - barH; // unten
+
+  while ((uint32_t)(millis() - startMs) < durationMs) {
+    const uint32_t nowMs = millis();
+    const uint32_t elapsed = (uint32_t)(nowMs - startMs);
+    const uint32_t remaining = (elapsed < durationMs) ? (durationMs - elapsed) : 0;
+
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+
+    // Kopfzeile links
+    display.setCursor(0, 0);
+    display.print("WiFi");
+
+    // Datum + Uhrzeit rechts oben
+    const uint32_t ts = nowEpochOrUptime();
+    String date = formatDateLabel(ts);
+    String tim  = formatTimeLabel(ts);
+
+    int16_t dateX = (int16_t)SCREEN_WIDTH - (int16_t)(6 * date.length());
+    int16_t timeX = (int16_t)SCREEN_WIDTH - (int16_t)(6 * tim.length());
+    if (dateX < 0) dateX = 0;
+    if (timeX < 0) timeX = 0;
+
+    display.setCursor(dateX, 0);
+    display.print(date);
+    display.setCursor(timeX, 10);
+    display.print(tim);
+
+    // Body
+    if (staConnected) {
+      String ssid = WiFi.SSID();
+      String ip   = WiFi.localIP().toString();
+
+      display.setCursor(0, bodyY + 0 * lineH);
+      display.print("Verbunden mit:");
+
+      // SSID ggf. in 2x, wenn sie kurz genug ist
+      const uint8_t maxBigChars = (uint8_t)(SCREEN_WIDTH / (6 * 2)); // bei TextSize(2)
+      if (ssid.length() <= maxBigChars) {
+        display.setTextSize(2);
+        int16_t x = (int16_t)((SCREEN_WIDTH - (int)(ssid.length() * 12)) / 2);
+        if (x < 0) x = 0;
+        display.setCursor(x, bodyY + 1 * lineH);
+        display.print(ssid);
+        display.setTextSize(1);
+        display.setCursor(0, bodyY + 4 * lineH);
+      } else {
+        //ssid = ellipsize(ssid, (uint8_t)(SCREEN_WIDTH / 6)); // TextSize(1)
+        display.setCursor(0, bodyY + 1 * lineH);
+        display.print(ssid);
+        display.setCursor(0, bodyY + 3 * lineH);
+      }
+
+      display.print("IP: ");
+      display.print(ip);
+    } else {
+      // Fallback / kein WLAN
+      String apSsid = apRunning ? WiFi.softAPSSID() : String("BME280-Setup");
+      String apIp   = apRunning ? WiFi.softAPIP().toString() : String("192.168.4.1");
+
+      //apSsid = ellipsize(apSsid, (uint8_t)(SCREEN_WIDTH / 6));
+
+      display.setCursor(0, bodyY + 0 * lineH);
+      display.print("WLAN geht nicht.");
+
+      display.setCursor(0, bodyY + 1 * lineH);
+      display.print("Hotspot: ");
+      display.print(apSsid);
+
+      display.setCursor(0, bodyY + 2 * lineH);
+      display.print("IP: ");
+      display.print(apIp);
+
+      display.setCursor(0, bodyY + 3 * lineH);
+      display.print("URL: /settings");
+    }
+
+    // Restzeit-Balken (voll = gerade gestartet, leer = abgelaufen)
+    display.drawRect(0, barY, SCREEN_WIDTH, barH, SSD1306_WHITE);
+    const uint16_t fillMax = (uint16_t)(SCREEN_WIDTH - 2);
+    const uint16_t fillW = (uint16_t)(((uint64_t)remaining * (uint64_t)fillMax) / (uint64_t)durationMs);
+    if (fillW > 0) display.fillRect(1, barY + 1, fillW, barH - 2, SSD1306_WHITE);
+
+    display.display();
+    delay(40);
+    yield();
+  }
+
+  // Zurück auf normalen Screen
+  redrawScreen();
 }
 
 static void redrawScreen() {
@@ -419,6 +552,12 @@ static bool connectKnownWifi(uint32_t perNetTimeoutMs = 12000) {
   WiFi.disconnect(true, true);
   delay(50);
 
+  display.clearDisplay();
+  display.setTextWrap(false);
+  display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+  display.setCursor(3, 3);
+  display.println("   connecting WiFi");
+  display.display();
   for (uint8_t i = 0; i < cfg.wifiCount; i++) {
     const char* ssid = cfg.wifi[i].ssid;
     const char* pass = cfg.wifi[i].pass;
@@ -426,6 +565,12 @@ static bool connectKnownWifi(uint32_t perNetTimeoutMs = 12000) {
 
     Serial.print("Trying WiFi: ");
     Serial.println(ssid);
+
+    display.print("#");
+    display.print(i);
+    display.print(": ");
+    display.println(ssid);
+    display.display();
 
     WiFi.begin(ssid, pass);
     uint32_t start = millis();
@@ -457,7 +602,8 @@ static void setupNtp() {
 
 static bool syncTimeNow(uint32_t waitMs = 8000) {
   if (WiFi.status() != WL_CONNECTED) return false;
-
+  lastNtpSyncTry = millis();
+  Serial.print("going to sync Time...");
   setupNtp();
   struct tm tmv;
   uint32_t start = millis();
@@ -467,7 +613,6 @@ static bool syncTimeNow(uint32_t waitMs = 8000) {
       timeSynced = true;
       lastSyncEpoch = nowEpoch;
       lastSyncMillis = millis();
-      lastNtpSyncMs = millis();
       Serial.print("Time synced: ");
       Serial.println(formatTs((uint32_t)nowEpoch));
       return true;
@@ -1038,8 +1183,16 @@ void setup() {
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
     while (true) { delay(1000); }
   }
+  delay(100);
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(3, 3);
+  display.print("starting...");
+  display.print(millis());
+  display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+  display.display();
+  delay(1000);
 
   bool ok = bme.begin(BME_ADDR);
   if (!ok) {
@@ -1070,6 +1223,8 @@ void setup() {
 
   syncTimeNow();
 
+  drawWifiStatus();
+
   setupWeb();
 
   float t, h, p;
@@ -1098,11 +1253,11 @@ void loop() {
   checkButtons();
 
   if (WiFi.status() == WL_CONNECTED && timeSynced) {
-    if ((uint32_t)(now - lastNtpSyncMs) >= cfg.ntpResyncMs) {
+    if ((uint32_t)(now - lastNtpSyncTry) >= cfg.ntpResyncMs) {
       syncTimeNow();
     }
   } else if (WiFi.status() == WL_CONNECTED && !timeSynced) {
-    if ((uint32_t)(now - lastNtpSyncMs) >= 60000UL) {
+    if ((uint32_t)(now - lastNtpSyncTry) >= 60000UL) {
       syncTimeNow();
     }
   }
@@ -1132,7 +1287,9 @@ void loop() {
 
   if (autoswitchScreens) {
     if ((uint32_t)(now - lastScreenMs) >= SCREEN_MS) {
-      lastScreenMs += SCREEN_MS;
+      //Serial.print("SCREEN_MS is:");
+      //Serial.println(SCREEN_MS);
+      lastScreenMs = now;
       screenIdx = (screenIdx + 1) % 3;
       needRedraw = true;
     }
