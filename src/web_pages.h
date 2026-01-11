@@ -40,7 +40,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML_INDEX(
       <div class="card"><canvas id="chart"></canvas></div>
       <div class="card">
         <div style="font-weight:650;margin-bottom:8px;">Aktuell</div>
-        <div class="stats">
+        <div class="stats" id="statsBox">
           <div class="stat" data-screen="0"><div class="k">Temp</div><div class="v" id="t">-</div></div>
           <div class="stat" data-screen="1"><div class="k">Hum</div><div class="v" id="h">-</div></div>
           <div class="stat" data-screen="2"><div class="k">Pres</div><div class="v" id="p">-</div></div>
@@ -73,8 +73,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML_INDEX(
     function updateStatHighlight(st){
       document.querySelectorAll(".stat").forEach(el=>el.classList.remove("active"));
       if(st.autoswitchScreens) return; // wenn autoswitch aktiv ist: nichts highlighten
-      const el=document.querySelector(`.stat[data-screen="${st.screenIdx}"]`);
-      if(el) el.classList.add("active");
+      document.querySelectorAll(`.stat[data-screen="${st.screenIdx}"]`).forEach(el=>el.classList.add("active"));
     }
 
     function updateDownloadLabel(st){
@@ -100,6 +99,40 @@ static const char INDEX_HTML[] PROGMEM = R"HTML_INDEX(
       btn.dataset.base = `download csv (${fmtInt(linesData)} lines ~${kb}KB)`;
       if(!btn.dataset.downloading) btn.textContent = btn.dataset.base;
     }
+
+    function updateDsStats(st){
+      const box=document.getElementById("statsBox");
+      if(!box) return;
+
+      // alte DS-Kacheln entfernen
+      box.querySelectorAll(".dsstat").forEach(el=>el.remove());
+
+      const arr = (st && Array.isArray(st.ds)) ? st.ds : [];
+      arr.forEach((s,i)=>{
+        const el=document.createElement("div");
+        el.className="stat dsstat";
+        el.dataset.screen="3";
+        el.title = (s && s.sn) ? String(s.sn) : "";
+
+        const k=document.createElement("div");
+        k.className="k";
+        k.textContent=`DS18B20#${i+1}`;
+
+        const v=document.createElement("div");
+        v.className="v";
+        const t = (s && s.t!==undefined) ? Number(s.t) : NaN;
+        v.textContent = Number.isFinite(t) ? (fmt(t,2)+" C") : "-";
+
+        el.appendChild(k);
+        el.appendChild(v);
+
+        // Klick: DS-Screen am OLED
+        el.addEventListener("click", ()=>setOledScreen(3));
+
+        box.appendChild(el);
+      });
+    }
+
     
     async function clearLog(){
       const clearBtn=document.getElementById("clearBtn");
@@ -174,6 +207,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML_INDEX(
       document.getElementById("t").textContent=fmt(st.temp,2)+" C";
       document.getElementById("h").textContent=fmt(st.hum,2)+" %";
       document.getElementById("p").textContent=fmt(st.pres,2)+" hPa";
+      updateDsStats(st);
       document.getElementById("time").textContent="Zeit: "+(st.time_str||"-");
       document.getElementById("wifi").textContent="WiFi: "+(st.ssid||"-");
       document.getElementById("ip").textContent="IP: "+(st.ip||"-");
@@ -305,6 +339,7 @@ static const char SETTINGS_HTML[] PROGMEM = R"HTML_SETTINGS(
           <button onclick="setScreen(0)">Temp</button>
           <button onclick="setScreen(1)">Hum</button>
           <button onclick="setScreen(2)">Pres</button>
+          <button onclick="setScreen(3)">DS</button>
           <span id="screenLbl" class="muted"></span>
         </div>
       </div>
@@ -352,7 +387,7 @@ static const char SETTINGS_HTML[] PROGMEM = R"HTML_SETTINGS(
     let cfg=null;
     function $(id){ return document.getElementById(id); }
     function setMsg(s){ $("msg").textContent=s; }
-    function setScreen(i){ cfg.screenIdx=i; $("screenLbl").textContent=" aktuell: "+["Temp","Hum","Pres"][i]; }
+    function setScreen(i){ cfg.screenIdx=i; const names=["Temp","Hum","Pres","DS"]; $("screenLbl").textContent=" aktuell: "+(names[i]||i); }
 
     function wifiRowHtml(i,w){
       return `

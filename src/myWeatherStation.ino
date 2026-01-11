@@ -3,6 +3,9 @@
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_BME280.h>
 
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <SPIFFS.h>
@@ -34,6 +37,31 @@ void ARDUINO_ISR_ATTR onBtn(void *arg) {
 // ---------------- Sensor ----------------
 #define BME_ADDR 0x76
 Adafruit_BME280 bme;
+
+// ---------------- DS18B20 (1-Wire) ----------------
+static const uint8_t ONE_WIRE_PIN = 4;          // GPIO 4 (DS18B20 Data)
+static const uint8_t DS18_MAX     = 16;         // max. Anzahl (bei Bedarf erhöhen)
+static const uint8_t DS18_RES_BITS = 12;        // 9..12 (12 = max Genauigkeit, max Zeit)
+
+OneWire oneWire(ONE_WIRE_PIN);
+DallasTemperature ds18(&oneWire);
+
+DeviceAddress dsAddr[DS18_MAX];
+char dsSn[DS18_MAX][17];                        // 16 hex chars + null
+float dsTempC[DS18_MAX];                        // zuletzt gelesene Werte
+uint8_t dsCount = 0;
+
+struct DsAgg {
+  bool has;
+  float vMin, vMax, vSum;
+  uint32_t n;
+};
+DsAgg dsAgg[DS18_MAX];
+
+bool dsConversionInProgress = false;
+uint32_t dsRequestMs = 0;
+uint16_t dsWaitMs = 750;
+
 
 // ---------------- ESP32-C3 Super Mini I2C Pins ----------------
 #ifndef SDA_PIN
@@ -192,7 +220,7 @@ static String makeDownloadFilename() {
     struct tm tmv;
     localtime_r(&tt, &tmv);
     char buf[40];
-    strftime(buf, sizeof(buf), "temp%Y-%m-%d_%H-%M-%S.log", &tmv);
+    strftime(buf, sizeof(buf), "temp%Y-%m-%d_%H-%M-%S.csv", &tmv);
     return String(buf);
   }
 
@@ -503,11 +531,77 @@ void drawWifiStatus() {
   redrawScreen();
 }
 
+static void drawDsListScreen() {
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  // Header links
+  display.setCursor(0, 0);
+  display.print("DS18B20");
+
+  // Datum + Uhrzeit rechts
+  const uint32_t ts = nowEpochOrUptime();
+  String date = formatDateLabel(ts);
+  String tim  = formatTimeLabel(ts);
+
+  int16_t dateX = (int16_t)SCREEN_WIDTH - (int16_t)(6 * date.length());
+  int16_t timeX = (int16_t)SCREEN_WIDTH - (int16_t)(6 * tim.length());
+  if (dateX < 0) dateX = 0;
+  if (timeX < 0) timeX = 0;
+
+  display.setCursor(dateX, 0);
+  display.print(date);
+  display.setCursor(timeX, 10);
+  display.print(tim);
+
+  const int lineH = 9;
+  int y = 20;
+
+  if (dsCount == 0) {
+    display.setCursor(0, y);
+    display.print("keine Sensoren");
+    return;
+  }
+
+  const uint8_t maxLines = (uint8_t)((SCREEN_HEIGHT - y) / lineH);
+  uint8_t shown = 0;
+
+  for (uint8_t i = 0; i < dsCount && shown < maxLines; i++) {
+    display.setCursor(0, y);
+    display.print("DS18B20 #");
+    display.print(i + 1);
+    display.print(": ");
+
+    char buf[16];
+    if (isfinite(dsTempC[i])) {
+      fmtFloat(buf, sizeof(buf), dsTempC[i], 2);
+      display.print(buf);
+      display.print(" C");
+    } else {
+      display.print("-");
+    }
+
+    y += lineH;
+    shown++;
+  }
+
+  if (dsCount > shown && shown > 0) {
+    display.setCursor(0, SCREEN_HEIGHT - lineH);
+    display.print("... (");
+    display.print(dsCount);
+    display.print(")");
+  }
+}
+
 static void redrawScreen() {
-  uint8_t var = screenIdx;
   display.clearDisplay();
-  drawHeader(var);
-  drawGraph(var);
+  if (screenIdx <= 2) {
+    uint8_t var = screenIdx;
+    drawHeader(var);
+    drawGraph(var);
+  } else {
+    drawDsListScreen();
+  }
   display.display();
 }
 
@@ -539,6 +633,7 @@ static void aggReset() {
   agg.tSum = agg.hSum = agg.pSum = 0.0f;
   agg.tMin = agg.hMin = agg.pMin = NAN;
   agg.tMax = agg.hMax = agg.pMax = NAN;
+  dsAggResetAll();
 }
 
 static void aggUpdate(float t, float h, float p) {
@@ -578,6 +673,123 @@ static bool readSensorOnce(float &t, float &h, float &p) {
   t = tt; h = hh; p = pp;
   return true;
 }
+
+// ---------------- DS18B20 helpers ----------------
+static uint16_t dsResolutionToWaitMs(uint8_t bits) {
+  switch (bits) {
+    case 9:  return 94;
+    case 10: return 188;
+    case 11: return 375;
+    default: return 750;
+  }
+}
+
+static void dsPrintAddress(const DeviceAddress addr) {
+  for (uint8_t i = 0; i < 8; i++) {
+    if (addr[i] < 16) Serial.print('0');
+    Serial.print(addr[i], HEX);
+  }
+}
+
+static void dsAddrToHexString(const DeviceAddress addr, char *out, size_t outLen) {
+  if (!out || outLen < 17) return;
+  for (uint8_t i = 0; i < 8; i++) {
+    snprintf(out + (i * 2), outLen - (i * 2), "%02X", (unsigned int)addr[i]);
+  }
+  out[16] = '\0';
+}
+
+static void dsAggResetAll() {
+  for (uint8_t i = 0; i < DS18_MAX; i++) {
+    dsAgg[i].has = false;
+    dsAgg[i].n = 0;
+    dsAgg[i].vSum = 0.0f;
+    dsAgg[i].vMin = NAN;
+    dsAgg[i].vMax = NAN;
+  }
+}
+
+static void dsAggUpdateOne(uint8_t idx, float v) {
+  if (idx >= dsCount) return;
+  if (!isfinite(v)) return;
+
+  DsAgg &a = dsAgg[idx];
+  if (!a.has || a.n == 0) {
+    a.has = true;
+    a.vMin = a.vMax = v;
+    a.vSum = v;
+    a.n = 1;
+    return;
+  }
+  if (v < a.vMin) a.vMin = v;
+  if (v > a.vMax) a.vMax = v;
+  a.vSum += v;
+  a.n++;
+}
+
+static void dsScanAndCacheDevices() {
+  dsCount = ds18.getDeviceCount();
+  Serial.print("Gefundene 1-Wire Devices: ");
+  Serial.println(dsCount);
+
+  if (dsCount > DS18_MAX) {
+    Serial.print("Warnung: Mehr Devices als DS18_MAX (");
+    Serial.print(DS18_MAX);
+    Serial.println("). Es werden nur die ersten gespeichert.");
+    dsCount = DS18_MAX;
+  }
+
+  Serial.print("Parasite Power Mode: ");
+  Serial.println(ds18.isParasitePowerMode() ? "JA" : "NEIN");
+
+  for (uint8_t i = 0; i < dsCount; i++) {
+    DeviceAddress addr;
+    if (ds18.getAddress(addr, i)) {
+      memcpy(dsAddr[i], addr, 8);
+      dsAddrToHexString(dsAddr[i], dsSn[i], sizeof(dsSn[i]));
+
+      Serial.print("DS18B20 #");
+      Serial.print(i + 1);
+      Serial.print(" ROM: ");
+      dsPrintAddress(dsAddr[i]);
+      Serial.println();
+    } else {
+      dsSn[i][0] = '\0';
+      Serial.print("Sensor ");
+      Serial.print(i);
+      Serial.println(" Adresse konnte nicht gelesen werden.");
+    }
+    dsTempC[i] = NAN;
+  }
+}
+
+static void dsStartConversion(uint32_t nowMs) {
+  if (dsCount == 0) return;
+  if (dsConversionInProgress) return;
+  ds18.requestTemperatures();   // non-blocking (setWaitForConversion(false))
+  dsRequestMs = nowMs;
+  dsConversionInProgress = true;
+}
+
+static void dsPollConversion(uint32_t nowMs) {
+  if (!dsConversionInProgress) return;
+  if ((uint32_t)(nowMs - dsRequestMs) < dsWaitMs) return;
+
+  // Werte abholen
+  for (uint8_t i = 0; i < dsCount; i++) {
+    float c = ds18.getTempC(dsAddr[i]);
+    if (c == DEVICE_DISCONNECTED_C || !isfinite(c)) {
+      dsTempC[i] = NAN;
+    } else {
+      dsTempC[i] = c;
+      dsAggUpdateOne(i, c);
+    }
+  }
+
+  dsConversionInProgress = false;
+}
+
+
 
 // ---------------- WiFi ----------------
 static void printWifiStatus() {
@@ -727,7 +939,18 @@ static bool ensureLogHeader() {
   if (SPIFFS.exists(LOG_PATH)) return true;
   File f = SPIFFS.open(LOG_PATH, FILE_WRITE);
   if (!f) return false;
-  f.println("epoch,ts,temp_min,temp_max,temp_avg,hum_min,hum_max,hum_avg,pres_min,pres_max,pres_avg");
+
+  String header = "epoch,ts,temp_min,temp_max,temp_avg,hum_min,hum_max,hum_avg,pres_min,pres_max,pres_avg";
+  for (uint8_t i = 0; i < dsCount; i++) {
+    String name = (dsSn[i][0] != '\0') ? String(dsSn[i]) : (String("DS18B20#") + String(i + 1));
+    header += ",";
+    header += name + "_min";
+    header += ",";
+    header += name + "_max";
+    header += ",";
+    header += name + "_avg";
+  }
+  f.println(header);
   f.close();
   return true;
 }
@@ -777,56 +1000,109 @@ static bool trimCsvIfNeededOnce() {
 }
 
 static void flushAggToLogAndPost() {
-  if (!agg.has || agg.n == 0) {
+  bool dsHas = false;
+  for (uint8_t i = 0; i < dsCount; i++) {
+    if (dsAgg[i].has && dsAgg[i].n > 0) { dsHas = true; break; }
+  }
+  bool bmeHas = (agg.has && agg.n > 0);
+
+  if (!bmeHas && !dsHas) {
     aggReset();
     return;
   }
 
   ensureLogHeader();
 
-  float tAvg = agg.tSum / (float)agg.n;
-  float hAvg = agg.hSum / (float)agg.n;
-  float pAvg = agg.pSum / (float)agg.n;
+  float tAvg = NAN, hAvg = NAN, pAvg = NAN;
+  if (bmeHas) {
+    tAvg = agg.tSum / (float)agg.n;
+    hAvg = agg.hSum / (float)agg.n;
+    pAvg = agg.pSum / (float)agg.n;
+  }
 
   uint32_t ts = nowEpochOrUptime();
   String tsStr = formatTs(ts);
 
+  auto csvAppendFloat = [](String &line, float v, uint8_t decimals) {
+    line += ",";
+    if (isfinite(v)) line += String((double)v, (unsigned int)decimals);
+  };
+
   File f = SPIFFS.open(LOG_PATH, FILE_APPEND);
   if (f) {
-    char buf[256];
-    snprintf(buf, sizeof(buf),
-      "%lu,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f",
-      (unsigned long)ts,
-      tsStr.c_str(),
-      agg.tMin, agg.tMax, tAvg,
-      agg.hMin, agg.hMax, hAvg,
-      agg.pMin, agg.pMax, pAvg
-    );
-    f.println(buf);
+    String line;
+    line.reserve(160 + (dsCount * 40));
+
+    line += String((unsigned long)ts);
+    line += ",";
+    line += tsStr;
+
+    csvAppendFloat(line, bmeHas ? agg.tMin : NAN, 3);
+    csvAppendFloat(line, bmeHas ? agg.tMax : NAN, 3);
+    csvAppendFloat(line, bmeHas ? tAvg    : NAN, 3);
+
+    csvAppendFloat(line, bmeHas ? agg.hMin : NAN, 3);
+    csvAppendFloat(line, bmeHas ? agg.hMax : NAN, 3);
+    csvAppendFloat(line, bmeHas ? hAvg    : NAN, 3);
+
+    csvAppendFloat(line, bmeHas ? agg.pMin : NAN, 3);
+    csvAppendFloat(line, bmeHas ? agg.pMax : NAN, 3);
+    csvAppendFloat(line, bmeHas ? pAvg    : NAN, 3);
+
+    for (uint8_t i = 0; i < dsCount; i++) {
+      float dMin = (dsAgg[i].has && dsAgg[i].n > 0) ? dsAgg[i].vMin : NAN;
+      float dMax = (dsAgg[i].has && dsAgg[i].n > 0) ? dsAgg[i].vMax : NAN;
+      float dAvg = (dsAgg[i].has && dsAgg[i].n > 0) ? (dsAgg[i].vSum / (float)dsAgg[i].n) : NAN;
+      csvAppendFloat(line, dMin, 3);
+      csvAppendFloat(line, dMax, 3);
+      csvAppendFloat(line, dAvg, 3);
+    }
+
+    f.println(line);
     f.close();
   }
 
   trimCsvIfNeededOnce();
 
   if (cfg.logPostUrl[0] != '\0') {
-    StaticJsonDocument<384> doc;
+    DynamicJsonDocument doc(512 + (size_t)dsCount * 180);
+
     doc["ts"] = ts;
     doc["ts_str"] = tsStr;
 
     JsonObject temp = doc.createNestedObject("temp");
-    temp["min"] = agg.tMin;
-    temp["max"] = agg.tMax;
-    temp["avg"] = tAvg;
-
-    JsonObject hum = doc.createNestedObject("hum");
-    hum["min"] = agg.hMin;
-    hum["max"] = agg.hMax;
-    hum["avg"] = hAvg;
-
+    JsonObject hum  = doc.createNestedObject("hum");
     JsonObject pres = doc.createNestedObject("pres");
-    pres["min"] = agg.pMin;
-    pres["max"] = agg.pMax;
-    pres["avg"] = pAvg;
+
+    if (bmeHas) {
+      temp["min"] = agg.tMin; temp["max"] = agg.tMax; temp["avg"] = tAvg;
+      hum["min"]  = agg.hMin; hum["max"]  = agg.hMax; hum["avg"]  = hAvg;
+      pres["min"] = agg.pMin; pres["max"] = agg.pMax; pres["avg"] = pAvg;
+    } else {
+      temp["min"] = nullptr; temp["max"] = nullptr; temp["avg"] = nullptr;
+      hum["min"]  = nullptr; hum["max"]  = nullptr; hum["avg"]  = nullptr;
+      pres["min"] = nullptr; pres["max"] = nullptr; pres["avg"] = nullptr;
+    }
+
+    JsonArray dsArr = doc.createNestedArray("ds");
+    for (uint8_t i = 0; i < dsCount; i++) {
+      JsonObject o = dsArr.createNestedObject();
+      o["idx"] = i + 1;
+      o["sn"]  = dsSn[i];
+
+      if (isfinite(dsTempC[i])) o["t"] = dsTempC[i];
+      else o["t"] = nullptr;
+
+      if (dsAgg[i].has && dsAgg[i].n > 0) {
+        o["min"] = dsAgg[i].vMin;
+        o["max"] = dsAgg[i].vMax;
+        o["avg"] = dsAgg[i].vSum / (float)dsAgg[i].n;
+      } else {
+        o["min"] = nullptr;
+        o["max"] = nullptr;
+        o["avg"] = nullptr;
+      }
+    }
 
     String payload;
     serializeJson(doc, payload);
@@ -870,7 +1146,7 @@ static void applyConfigRuntime() {
   SAMPLE_MS = (cfg.sampleMs < 100) ? 100 : cfg.sampleMs;
   SCREEN_MS = (cfg.screenMs < 500) ? 500 : cfg.screenMs;
   autoswitchScreens = cfg.autoswitchScreens;
-  screenIdx = cfg.screenIdx % 3;
+  screenIdx = cfg.screenIdx % 4;
 
   cfg.logShortMs = (cfg.logShortMs < 250) ? 250 : cfg.logShortMs;
   cfg.logLongMs  = (cfg.logLongMs < 1000) ? 1000 : cfg.logLongMs;
@@ -1001,10 +1277,21 @@ static void handleRoot() { server.send_P(200, "text/html", INDEX_HTML); }
 static void handleSettings() { server.send_P(200, "text/html", SETTINGS_HTML); }
 
 static void handleApiState() {
-  StaticJsonDocument<768> doc;
+  StaticJsonDocument<2048> doc;
   doc["temp"] = curTemp;
   doc["hum"]  = curHum;
   doc["pres"] = curPres;
+
+  doc["dsCount"] = dsCount;
+  JsonArray dsArr = doc.createNestedArray("ds");
+  for (uint8_t i = 0; i < dsCount; i++) {
+    JsonObject o = dsArr.createNestedObject();
+    o["idx"] = i + 1;
+    o["sn"]  = dsSn[i];
+    if (isfinite(dsTempC[i])) o["t"] = dsTempC[i];
+    else o["t"] = nullptr;
+  }
+
 
   doc["screenIdx"] = screenIdx;
   doc["autoswitchScreens"] = autoswitchScreens;
@@ -1072,7 +1359,7 @@ static void handleApiScreenSet() {
     }
   }
 
-  if (idx < 0 || idx > 2) {
+  if (idx < 0 || idx > 3) {
     server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad idx\"}");
     return;
   }
@@ -1267,11 +1554,11 @@ static void handleApiLogClear() {
 
   // optional: Datei sofort wieder anlegen (damit spätere Append-Logik sicher ist)
   // und Header schreiben (bitte Header an deinen bestehenden CSV-Header anpassen)
-  File f = SPIFFS.open(LOG_PATH, FILE_WRITE);
+  /*File f = SPIFFS.open(LOG_PATH, FILE_WRITE);
   if (f) {
-    f.println("epoch,ts,temp_min,temp_max,temp_avg,hum_min,hum_max,hum_avg,pres_min,pres_max,pres_avg");  // (hier ggf. deinen echten Header einsetzen)
+    //f.println("epoch,ts,temp_min,temp_max,temp_avg,hum_min,hum_max,hum_avg,pres_min,pres_max,pres_avg");  // (hier ggf. deinen echten Header einsetzen)
     f.close();
-  }
+  }*/ensureLogHeader();
 
   refreshLogInfo(true);
 
@@ -1292,7 +1579,7 @@ static void handleButton(uint8_t i) {
   Serial.println(i);
 
   if (cfg.btn[i].switchScreen) {
-    screenIdx = (screenIdx + 1) % 3;
+    screenIdx = (screenIdx + 1) % 4;
     return;
   }
   if (cfg.btn[i].url[0] != '\0') {
@@ -1353,6 +1640,16 @@ void setup() {
     while (true) { delay(1000); }
   }
 
+
+  // DS18B20 init (1-Wire)
+  ds18.begin();
+  ds18.setWaitForConversion(false);
+  dsWaitMs = dsResolutionToWaitMs(DS18_RES_BITS);
+  ds18.setResolution(DS18_RES_BITS);
+
+  dsScanAndCacheDevices();
+
+
   for (uint8_t i = 0; i < GRAPH_W; i++) {
     hist[VAR_TEMP][i] = NAN;
     hist[VAR_HUM][i]  = NAN;
@@ -1410,22 +1707,32 @@ void loop() {
     }
   }
 
+  // DS18B20 conversion completion poll (non-blocking)
+  dsPollConversion(now);
+
   bool dueOled = ((uint32_t)(now - lastOledSampleMs) >= SAMPLE_MS);
   bool dueLog  = ((uint32_t)(now - lastLogSampleMs) >= cfg.logShortMs);
 
   if (dueOled || dueLog) {
     float t, h, p;
-    if (readSensorOnce(t, h, p)) {
+    bool bmeOk = readSensorOnce(t, h, p);
+    if (bmeOk) {
       curTemp = t; curHum = h; curPres = p;
+    }
 
-      if (dueOled) {
-        lastOledSampleMs += SAMPLE_MS;
-        pushOledHistory(t, h, p);
-        needRedraw = true;
-      }
+    if (dueOled && bmeOk) {
+      lastOledSampleMs += SAMPLE_MS;
+      pushOledHistory(t, h, p);
+      needRedraw = true;
+    }
 
-      if (dueLog) {
-        lastLogSampleMs += cfg.logShortMs;
+    if (dueLog) {
+      lastLogSampleMs += cfg.logShortMs;
+
+      // DS18B20 Werte nur im Logging-Zyklus anstoßen
+      dsStartConversion(now);
+
+      if (bmeOk) {
         uint32_t ts = nowEpochOrUptime();
         pushWebHistory(ts, t, h, p);
         aggUpdate(t, h, p);
@@ -1433,12 +1740,16 @@ void loop() {
     }
   }
 
+  // evtl. sofort fertig (z.B. bei niedriger Auflösung)
+  dsPollConversion(now);
+
+
   if (autoswitchScreens) {
     if ((uint32_t)(now - lastScreenMs) >= SCREEN_MS) {
       //Serial.print("SCREEN_MS is:");
       //Serial.println(SCREEN_MS);
       lastScreenMs = now;
-      screenIdx = (screenIdx + 1) % 3;
+      screenIdx = (screenIdx + 1) % 4;
       needRedraw = true;
     }
   }
