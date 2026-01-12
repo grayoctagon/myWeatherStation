@@ -158,7 +158,8 @@ sort($months);
     .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
     .metrics{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
     .metrics label{display:flex;gap:6px;align-items:center;background:#f0f0f7;border:1px solid #e0e0ee;border-radius:10px;padding:6px 8px;}
-    canvas{width:100%;height:560px;}
+    .chartWrap{position:relative;height:560px;width:100%;}
+    #c{display:block;width:100% !important;height:100% !important;}
   </style>
 </head>
 <body>
@@ -233,7 +234,7 @@ sort($months);
     <div class="card">
       <h2 style="margin:0 0 8px 0;">Graph</h2>
       <p class="muted" style="margin:0 0 12px 0;">Linie zeigt Avg, Bereich zeigt Min/Max (20% transparent).</p>
-      <canvas id="c"></canvas>
+      <div class="chartWrap"><canvas id="c"></canvas></div>
     </div>
   </div>
 </main>
@@ -415,7 +416,7 @@ async function draw(){
     datasets.push(makeAvgDataset(b.labelBase, b.avg, b.axis));
   }
 
-  const ctx = document.getElementById('c');
+  const ctx = document.getElementById('c').getContext('2d');
 
   if(chart) chart.destroy();
   chart = new Chart(ctx, {
