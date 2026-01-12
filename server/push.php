@@ -72,8 +72,6 @@ if ($maxRate > 0 && is_file($path)) {
   }
 }
 
-$dsMax = (int)($cfg['ds18Max'] ?? DS18_MAX_DEFAULT);
-if ($dsMax <= 0 || $dsMax > 64) $dsMax = DS18_MAX_DEFAULT;
 
 function val_or_empty($v): string {
   if ($v === null) return '';
@@ -93,18 +91,18 @@ function nested_minmaxavg(array $doc, string $key): array {
   ];
 }
 
-// map ds array by idx
-$dsByIdx = [];
+
+// map ds array by serial number (sn)
+$dsBySn = [];
+$dsSns = [];
 $ds = $doc['ds'] ?? [];
 if (is_array($ds)) {
-  foreach ($ds as $row) {
-    if (!is_array($row)) continue;
-    $idx = $row['idx'] ?? null;
-    if (!is_int($idx)) {
-      if (is_string($idx) && ctype_digit($idx)) $idx = (int)$idx;
-    }
-    if (!is_int($idx) || $idx < 1) continue;
-    $dsByIdx[$idx] = $row;
+  foreach ($ds as $r) {
+    if (!is_array($r)) continue;
+    $sn = $r['sn'] ?? '';
+    if (!is_string($sn) || $sn === '') continue;
+    if (!isset($dsBySn[$sn])) $dsSns[] = $sn;
+    $dsBySn[$sn] = $r;
   }
 }
 
@@ -113,68 +111,171 @@ if (is_array($ds)) {
 [$pMin, $pMax, $pAvg] = nested_minmaxavg($doc, 'pres');
 
 $tsStr = val_or_empty($doc['ts_str'] ?? $dt->format(DateTimeInterface::ATOM));
-$remoteIp = $_SERVER['REMOTE_ADDR'] ?? '';
-
-$header = [
+$headerBase = [
   'ts','ts_str',
   'temp_min','temp_max','temp_avg',
   'hum_min','hum_max','hum_avg',
-  'pres_min','pres_max','pres_avg',
-  'remote_ip'
+  'pres_min','pres_max','pres_avg'
 ];
 
-for ($i = 1; $i <= $dsMax; $i++) {
-  $header[] = "ds{$i}_sn";
-  $header[] = "ds{$i}_t";
-  $header[] = "ds{$i}_min";
-  $header[] = "ds{$i}_max";
-  $header[] = "ds{$i}_avg";
+$payloadCols = $headerBase;
+foreach ($dsSns as $sn) {
+  // columns are derived from DS18B20 serial number
+  $payloadCols[] = "ds_{$sn}_min";
+  $payloadCols[] = "ds_{$sn}_max";
+  $payloadCols[] = "ds_{$sn}_avg";
 }
 
-$row = [
-  (string)$ts,
-  $tsStr,
-  $tMin, $tMax, $tAvg,
-  $hMin, $hMax, $hAvg,
-  $pMin, $pMax, $pAvg,
-  $remoteIp
+function rewrite_csv_expand_and_dedupe(string $path, array $existingHeader, array $missingCols): bool {
+  $newHeader = array_values(array_merge($existingHeader, $missingCols));
+  $tmp = $path . '.tmp.' . bin2hex(random_bytes(4));
+
+  $in = fopen($path, 'rb');
+  if ($in === false) return false;
+
+  $out = fopen($tmp, 'wb');
+  if ($out === false) { fclose($in); return false; }
+
+  // discard original header
+  fgetcsv($in, 0, ';');
+
+  fputcsv($out, $newHeader, ';');
+
+  $existingCount = count($existingHeader);
+  $pad = count($missingCols);
+
+  while (($row = fgetcsv($in, 0, ';')) !== false) {
+    if (!is_array($row)) continue;
+
+    // remove duplicated header lines in the middle of the file
+    if ($row === $existingHeader || $row === $newHeader) continue;
+
+    // normalize row length to existing header columns
+    $row = array_slice($row, 0, $existingCount);
+    while (count($row) < $existingCount) $row[] = '';
+
+    // append new empty columns
+    for ($i = 0; $i < $pad; $i++) $row[] = '';
+
+    fputcsv($out, $row, ';');
+  }
+
+  fclose($in);
+  fclose($out);
+
+  if (!rename($tmp, $path)) {
+    @unlink($tmp);
+    return false;
+  }
+
+  return true;
+}
+
+$lockPath = $path . '.lock';
+$lh = fopen($lockPath, 'c');
+if ($lh === false) {
+  add_log('error-push-write', $apiKeyId, 'cannot_open_lock: ' . $lockPath);
+  json_response(500, ['ok' => false, 'error' => 'cannot_open_lock']);
+}
+if (!flock($lh, LOCK_EX)) {
+  fclose($lh);
+  add_log('error-push-write', $apiKeyId, 'cannot_lock: ' . $lockPath);
+  json_response(500, ['ok' => false, 'error' => 'cannot_lock']);
+}
+
+clearstatcache(true, $path);
+
+$header = [];
+if (is_file($path) && filesize($path) > 0) {
+  $in = fopen($path, 'rb');
+  if ($in === false) {
+    flock($lh, LOCK_UN); fclose($lh);
+    add_log('error-push-write', $apiKeyId, 'cannot_open_csv_read: ' . $path);
+    json_response(500, ['ok' => false, 'error' => 'cannot_open_csv']);
+  }
+  $existingHeader = fgetcsv($in, 0, ';');
+  fclose($in);
+
+  if (!is_array($existingHeader) || count($existingHeader) === 0) {
+    flock($lh, LOCK_UN); fclose($lh);
+    add_log('error-push-write', $apiKeyId, 'bad_header: ' . $path);
+    json_response(500, ['ok' => false, 'error' => 'bad_header']);
+  }
+  $existingHeader = array_map('strval', $existingHeader);
+
+  $missing = array_values(array_diff($payloadCols, $existingHeader));
+
+  // detect duplicated header lines (legacy bug cleanup)
+  $dup = 0;
+  $scan = fopen($path, 'rb');
+  if ($scan !== false) {
+    while (($r = fgetcsv($scan, 0, ';')) !== false) {
+      if (!is_array($r)) continue;
+      if ($r === $existingHeader) $dup++;
+      if ($dup >= 2) break;
+    }
+    fclose($scan);
+  }
+
+  if (count($missing) > 0 || $dup >= 2) {
+    if (!rewrite_csv_expand_and_dedupe($path, $existingHeader, $missing)) {
+      flock($lh, LOCK_UN); fclose($lh);
+      add_log('error-push-write', $apiKeyId, 'csv_rewrite_failed: ' . $path);
+      json_response(500, ['ok' => false, 'error' => 'csv_rewrite_failed']);
+    }
+    $header = array_values(array_merge($existingHeader, $missing));
+  } else {
+    $header = $existingHeader;
+  }
+} else {
+  // new (or empty) file: write header once
+  $header = $payloadCols;
+  $out = fopen($path, 'wb');
+  if ($out === false) {
+    flock($lh, LOCK_UN); fclose($lh);
+    add_log('error-push-write', $apiKeyId, 'cannot_open_csv_create: ' . $path);
+    json_response(500, ['ok' => false, 'error' => 'cannot_open_csv']);
+  }
+  fputcsv($out, $header, ';');
+  fclose($out);
+}
+
+$values = [
+  'ts' => (string)$ts,
+  'ts_str' => $tsStr,
+  'temp_min' => val_or_empty($tMin),
+  'temp_max' => val_or_empty($tMax),
+  'temp_avg' => val_or_empty($tAvg),
+  'hum_min' => val_or_empty($hMin),
+  'hum_max' => val_or_empty($hMax),
+  'hum_avg' => val_or_empty($hAvg),
+  'pres_min' => val_or_empty($pMin),
+  'pres_max' => val_or_empty($pMax),
+  'pres_avg' => val_or_empty($pAvg),
 ];
 
-for ($i = 1; $i <= $dsMax; $i++) {
-  $r = $dsByIdx[$i] ?? null;
-  if (!is_array($r)) {
-    $row = array_merge($row, ['', '', '', '', '']);
-    continue;
-  }
-  $row[] = val_or_empty($r['sn'] ?? '');
-  $row[] = val_or_empty($r['t'] ?? '');
-  $row[] = val_or_empty($r['min'] ?? '');
-  $row[] = val_or_empty($r['max'] ?? '');
-  $row[] = val_or_empty($r['avg'] ?? '');
+foreach ($dsBySn as $sn => $r) {
+  $values["ds_{$sn}_min"] = val_or_empty($r['min'] ?? '');
+  $values["ds_{$sn}_max"] = val_or_empty($r['max'] ?? '');
+  $values["ds_{$sn}_avg"] = val_or_empty($r['avg'] ?? '');
+}
+
+$row = [];
+foreach ($header as $col) {
+  $row[] = val_or_empty($values[$col] ?? '');
 }
 
 $fh = fopen($path, 'ab');
 if ($fh === false) {
-  add_log('error-push-write', $apiKeyId, 'cannot_open_csv: ' . $path);
+  flock($lh, LOCK_UN); fclose($lh);
+  add_log('error-push-write', $apiKeyId, 'cannot_open_csv_append: ' . $path);
   json_response(500, ['ok' => false, 'error' => 'cannot_open_csv']);
 }
-
-if (!flock($fh, LOCK_EX)) {
-  fclose($fh);
-  add_log('error-push-write', $apiKeyId, 'cannot_lock_csv: ' . $path);
-  json_response(500, ['ok' => false, 'error' => 'cannot_lock_csv']);
-}
-
-$needsHeader = (ftell($fh) === 0) || (filesize($path) === 0);
-if ($needsHeader) {
-  fputcsv($fh, $header, ';');
-}
-
 fputcsv($fh, $row, ';');
-
-fflush($fh);
-flock($fh, LOCK_UN);
 fclose($fh);
+
+flock($lh, LOCK_UN);
+fclose($lh);
 
 add_log('success-push', $apiKeyId, 'sensorID=' . $sensorID . ' file=' . basename($path));
 

@@ -22,9 +22,6 @@ $sensorIDs = array_values(array_filter($sensorIDs, fn($s) => is_string($s) && $s
 $dataDir = $a['csvDir'] ?? ($cfg['dataDirDefault'] ?? DEFAULT_DATA_DIR);
 if (!is_string($dataDir) || $dataDir === '') $dataDir = DEFAULT_DATA_DIR;
 
-$dsMax = (int)($cfg['ds18Max'] ?? DS18_MAX_DEFAULT);
-if ($dsMax <= 0 || $dsMax > 64) $dsMax = DS18_MAX_DEFAULT;
-
 function list_months_for_sensor(string $dataDir, string $sensorID): array {
   $months = [];
   if (!is_dir($dataDir)) return [];
@@ -38,13 +35,15 @@ function list_months_for_sensor(string $dataDir, string $sensorID): array {
   return $out;
 }
 
-function read_csv_series(string $path, int $dsMax): array {
+function read_csv_series(string $path): array {
   if (!is_file($path)) return ['ok' => false, 'error' => 'not_found'];
   $fh = fopen($path, 'rb');
   if ($fh === false) return ['ok' => false, 'error' => 'cannot_open'];
 
   $header = fgetcsv($fh, 0, ';');
-  if (!is_array($header)) { fclose($fh); return ['ok' => false, 'error' => 'bad_header']; }
+  if (!is_array($header) || count($header) === 0) { fclose($fh); return ['ok' => false, 'error' => 'bad_header']; }
+  $header = array_map('strval', $header);
+
   $idx = [];
   foreach ($header as $i => $h) $idx[(string)$h] = (int)$i;
 
@@ -54,15 +53,31 @@ function read_csv_series(string $path, int $dsMax): array {
     'pres' => ['avg' => 'pres_avg', 'min' => 'pres_min', 'max' => 'pres_max', 'unit' => 'hPa'],
   ];
 
-  for ($i = 1; $i <= $dsMax; $i++) {
-    $metrics["ds{$i}"] = ['avg' => "ds{$i}_avg", 'min' => "ds{$i}_min", 'max' => "ds{$i}_max", 'sn' => "ds{$i}_sn", 'unit' => '°C'];
+  // discover DS18B20 serials from header columns like ds_<SN>_avg/min/max
+  $dsSeen = [];
+  foreach ($header as $h) {
+    if (!is_string($h)) continue;
+    if (preg_match('/^ds_(.+)_(min|max|avg)$/', $h, $m)) {
+      $sn = (string)$m[1];
+      if ($sn !== '') $dsSeen[$sn] = true;
+    }
+  }
+  foreach (array_keys($dsSeen) as $sn) {
+    $k = 'ds_' . $sn;
+    $metrics[$k] = [
+      'avg' => "ds_{$sn}_avg",
+      'min' => "ds_{$sn}_min",
+      'max' => "ds_{$sn}_max",
+      'sn'  => $sn,
+      'unit' => '°C'
+    ];
   }
 
   $out = [];
-  foreach ($metrics as $k => $_) $out[$k] = ['t' => [], 'avg' => [], 'min' => [], 'max' => [], 'sn' => ''];
+  foreach ($metrics as $k => $m) $out[$k] = ['t' => [], 'avg' => [], 'min' => [], 'max' => [], 'sn' => (string)($m['sn'] ?? '')];
 
   while (($row = fgetcsv($fh, 0, ';')) !== false) {
-    if (!is_array($row) || count($row) < 3) continue;
+    if (!is_array($row) || count($row) < 2) continue;
 
     $ts = $row[$idx['ts'] ?? 0] ?? '';
     if (!is_string($ts) || $ts === '' || !ctype_digit($ts)) continue;
@@ -73,28 +88,23 @@ function read_csv_series(string $path, int $dsMax): array {
       $min = $row[$idx[$m['min']] ?? -1] ?? '';
       $max = $row[$idx[$m['max']] ?? -1] ?? '';
 
-      if ($avg === '' && $min === '' && $max === '') continue;
+      if (!is_string($avg) || $avg === '' || !is_numeric($avg)) continue;
 
       $out[$k]['t'][] = $t;
-      $out[$k]['avg'][] = ($avg === '' ? null : (float)str_replace(',', '.', $avg));
-      $out[$k]['min'][] = ($min === '' ? null : (float)str_replace(',', '.', $min));
-      $out[$k]['max'][] = ($max === '' ? null : (float)str_replace(',', '.', $max));
+      $out[$k]['avg'][] = (float)$avg;
 
-      if (!empty($m['sn']) && $out[$k]['sn'] === '') {
-        $sn = $row[$idx[$m['sn']] ?? -1] ?? '';
-        if (is_string($sn) && $sn !== '') $out[$k]['sn'] = $sn;
-      }
+      $out[$k]['min'][] = (is_string($min) && $min !== '' && is_numeric($min)) ? (float)$min : null;
+      $out[$k]['max'][] = (is_string($max) && $max !== '' && is_numeric($max)) ? (float)$max : null;
     }
   }
+
   fclose($fh);
 
-  // prune empty ds metrics
   foreach (array_keys($out) as $k) {
-    if ($k === 'temp' || $k === 'hum' || $k === 'pres') continue;
     if (empty($out[$k]['t'])) unset($out[$k]);
   }
 
-  return ['ok' => true, 'series' => $out];
+  return ['ok' => true, 'series' => $out, 'availableMetrics' => array_keys($out)];
 }
 
 $ajax = $_GET['ajax'] ?? '';
@@ -106,12 +116,12 @@ if ($ajax === 'load') {
   require_sensor_allowed($sensorID);
 
   $path = rtrim($dataDir, "/\\") . DIRECTORY_SEPARATOR . $month . '_' . $sensorID . '.csv';
-  $r = read_csv_series($path, $dsMax);
+  $r = read_csv_series($path);
   if (!$r['ok']) {
     add_log('error-view-csv-not-found', $apiKeyId, 'csv_not_found sensorID=' . $sensorID . ' month=' . $month);
     json_response(404, ['ok' => false, 'error' => 'csv_not_found']);
   }
-  json_response(200, ['ok' => true, 'sensorID' => $sensorID, 'month' => $month, 'dsMax' => $dsMax, 'series' => $r['series']]);
+  json_response(200, ['ok' => true, 'sensorID' => $sensorID, 'month' => $month, 'series' => $r['series'], 'availableMetrics' => $r['availableMetrics']]);
 }
 
 // log page view (not the AJAX calls)
@@ -210,10 +220,8 @@ sort($months);
           <label><input type="checkbox" data-m="temp" checked /> Temp (°C)</label>
           <label><input type="checkbox" data-m="hum" checked /> Hum (%)</label>
           <label><input type="checkbox" data-m="pres" /> Pres (hPa)</label>
-          <?php for ($i=1; $i <= $dsMax; $i++): ?>
-            <label><input type="checkbox" data-m="<?php echo "ds{$i}"; ?>" /> <?php echo "DS{$i} (°C)"; ?></label>
-          <?php endfor; ?>
-        </div>
+          <div id="dsMetrics" style="display:contents;"></div>
+</div>
         <div class="stack" style="margin-top:12px;">
           <button class="btn" id="btnDraw">Graph aktualisieren</button>
           <button class="btn secondary" id="btnClear">Auswahl löschen</button>
@@ -252,8 +260,36 @@ function metricMeta(m){
   if(m==='temp') return {name:'Temp (°C)', axis:'y'};
   if(m==='hum') return {name:'Hum (%)', axis:'y'};
   if(m==='pres') return {name:'Pres (hPa)', axis:'y2'};
-  if(m.startsWith('ds')) return {name: m.toUpperCase()+' (°C)', axis:'y'};
+  if(m.startsWith('ds_')) return {name:'DS (°C)', axis:'y'};
   return {name:m, axis:'y'};
+}
+
+
+function ensureDsCheckbox(m, sn){
+  const host = document.getElementById('dsMetrics');
+  if(!host) return;
+  if(document.querySelector(`#metrics input[data-m="${m}"]`)) return;
+
+  const label = document.createElement('label');
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.dataset.m = m;
+  cb.checked = false;
+
+  label.appendChild(cb);
+  const t = document.createTextNode(` DS ${sn} (°C)`);
+  label.appendChild(t);
+  host.appendChild(label);
+}
+
+function ingestAvailableMetricsFromLoad(j){
+  if(!j || !Array.isArray(j.availableMetrics) || !j.series) return;
+  for(const m of j.availableMetrics){
+    if(typeof m !== 'string') continue;
+    if(!m.startsWith('ds_')) continue;
+    const sn = (j.series[m] && j.series[m].sn) ? j.series[m].sn : m.substring(3);
+    ensureDsCheckbox(m, sn);
+  }
 }
 
 function selectedMatrix(){
@@ -279,6 +315,7 @@ async function loadOne(sensorID, month){
   const r = await fetch(u.toString(), {credentials:'same-origin'});
   const j = await r.json();
   if(!j.ok) throw new Error(j.error||'load_failed');
+  ingestAvailableMetricsFromLoad(j);
   return j;
 }
 
