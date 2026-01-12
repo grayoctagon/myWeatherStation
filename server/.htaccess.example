@@ -1,0 +1,13 @@
+# Optional but recommended (Apache):
+# Protect config.json from being downloaded.
+<Files "config.json">
+  Require all denied
+</Files>
+
+# Protect log file if it's inside webroot
+<Files "log.json">
+  Require all denied
+</Files>
+
+# If you want a clean /endpoint/ url:
+DirectoryIndex index.php

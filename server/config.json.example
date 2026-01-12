@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "dataDirDefault": "./data",
+  "logPath": "./data/log.json",
+  "ds18Max": 16,
+  "apikeys": [
+    {
+      "id": "replace_me_1",
+      "hash": "REPLACE_WITH_password_hash_for_esp",
+      "allowedSensorIDs": [
+        "A1",
+        "A2"
+      ],
+      "canPushData": true,
+      "canViewData": false,
+      "canEditConfig": false,
+      "maxUpdateRate": 290,
+      "csvDir": "./data"
+    },
+    {
+      "id": "replace_me_2",
+      "hash": "REPLACE_WITH_password_hash_OF_adminPw",
+      "allowedSensorIDs": [
+        "A1",
+        "A2"
+      ],
+      "canPushData": false,
+      "canViewData": true,
+      "canEditConfig": true,
+      "maxUpdateRate": 290,
+      "csvDir": "./data"
+    }
+  ]
+}
